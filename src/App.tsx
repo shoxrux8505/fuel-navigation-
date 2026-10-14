@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { FUEL_STATIONS_DATA, FuelStation, TIER_CONFIG } from './data/fuelStations';
 import { ColorMetric, FilterOptions, TripPlanResult, ViewMode } from './types';
 import { Header } from './components/Header';
@@ -9,6 +9,8 @@ import { StationTable } from './components/StationTable';
 import { TripPlanner } from './components/TripPlanner';
 import { AnalyticsView } from './components/AnalyticsView';
 import { SerpApiModal } from './components/SerpApiModal';
+import { RouteNavigationPanel } from './components/RouteNavigationPanel';
+import { fetchDrivingRoute, findStationsAlongRoute, NavigationRoute } from './utils/routing';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewMode>('map');
@@ -17,6 +19,15 @@ export default function App() {
   const [colorMetric, setColorMetric] = useState<ColorMetric>('best_disc');
   const [activeTrip, setActiveTrip] = useState<TripPlanResult | null>(null);
   const [isSerpApiOpen, setIsSerpApiOpen] = useState(false);
+
+  // PU & DEL Navigation Route State
+  const [navigationMode, setNavigationMode] = useState<boolean>(true); // default true for user's explicit request
+  const [activeRoute, setActiveRoute] = useState<NavigationRoute | null>(null);
+  const [isLoadingRoute, setIsLoadingRoute] = useState<boolean>(false);
+  const [corridorBuffer, setCorridorBuffer] = useState<number>(25);
+  const [isNavPanelCollapsed, setIsNavPanelCollapsed] = useState<boolean>(false);
+  const [isMapPickingPU, setIsMapPickingPU] = useState<boolean>(false);
+  const [isMapPickingDEL, setIsMapPickingDEL] = useState<boolean>(false);
 
   const [filters, setFilters] = useState<FilterOptions>({
     searchQuery: '',
@@ -42,9 +53,86 @@ export default function App() {
     });
   };
 
+  // Route calculation handler
+  const handleCalculateRoute = useCallback(
+    async (
+      pu: { label: string; lat: number; lng: number },
+      del: { label: string; lat: number; lng: number },
+      bufferMiles: number = corridorBuffer
+    ) => {
+      setIsLoadingRoute(true);
+      try {
+        const roadData = await fetchDrivingRoute(pu.lat, pu.lng, del.lat, del.lng);
+        const stops = findStationsAlongRoute(FUEL_STATIONS_DATA, roadData.coordinates, bufferMiles);
+
+        let cheapest = stops.find((s) => s.isCheapestOnRoute) || null;
+        let bestSav = stops.find((s) => s.isMaxSavingsOnRoute) || null;
+
+        const totalSav = stops.reduce((acc, s) => acc + s.station.savings * filters.tankGallons, 0);
+
+        const routeResult: NavigationRoute = {
+          puLocation: pu,
+          delLocation: del,
+          distanceMiles: roadData.distanceMiles,
+          durationMinutes: roadData.durationMinutes,
+          geometry: roadData.coordinates,
+          stops,
+          cheapestStop: cheapest,
+          bestSavingsStop: bestSav,
+          totalPotentialSavings: totalSav
+        };
+
+        setActiveRoute(routeResult);
+      } catch (err) {
+        console.error('Failed to calculate route:', err);
+      } finally {
+        setIsLoadingRoute(false);
+      }
+    },
+    [corridorBuffer, filters.tankGallons]
+  );
+
+  // Initialize initial route on load (Dallas, TX to Atlanta, GA)
+  useEffect(() => {
+    handleCalculateRoute(
+      { label: 'Dallas, TX', lat: 32.7767, lng: -96.7970 },
+      { label: 'Atlanta, GA', lat: 33.7490, lng: -84.3880 },
+      25
+    );
+  }, []);
+
+  // Map click handler for picking PU or DEL on the map
+  const handleMapClickPoint = (lat: number, lng: number) => {
+    if (isMapPickingPU) {
+      const label = `PU (${lat.toFixed(2)}°, ${lng.toFixed(2)}°)`;
+      const newPu = { label, lat, lng };
+      setIsMapPickingPU(false);
+      if (activeRoute) {
+        handleCalculateRoute(newPu, activeRoute.delLocation, corridorBuffer);
+      }
+    } else if (isMapPickingDEL) {
+      const label = `DEL (${lat.toFixed(2)}°, ${lng.toFixed(2)}°)`;
+      const newDel = { label, lat, lng };
+      setIsMapPickingDEL(false);
+      if (activeRoute) {
+        handleCalculateRoute(activeRoute.puLocation, newDel, corridorBuffer);
+      }
+    }
+  };
+
+  const handleCancelMapPick = () => {
+    setIsMapPickingPU(false);
+    setIsMapPickingDEL(false);
+  };
+
+  const handleClearRoute = () => {
+    setActiveRoute(null);
+  };
+
   // Filter stations based on search, state, tiers, and corridor (if trip is active)
   const filteredStations = useMemo(() => {
-    const baseList = activeTrip ? activeTrip.stationsAlongRoute : FUEL_STATIONS_DATA;
+    // If navigation mode is active and user has a route, prioritize route stations or full network
+    const baseList = activeRoute ? activeRoute.stops.map((s) => s.station) : (activeTrip ? activeTrip.stationsAlongRoute : FUEL_STATIONS_DATA);
 
     return baseList
       .filter((s) => {
@@ -91,7 +179,7 @@ export default function App() {
         if (filters.sortBy === 'store_asc') return a.store - b.store;
         return 0;
       });
-  }, [filters, activeTrip]);
+  }, [filters, activeRoute, activeTrip]);
 
   const handleApplyTripToMap = (trip: TripPlanResult) => {
     setActiveTrip(trip);
@@ -144,18 +232,22 @@ export default function App() {
       <main className="flex-1 flex overflow-hidden relative">
         {currentView === 'map' && (
           <>
-            <StationSidebar
-              stations={filteredStations}
-              allStations={FUEL_STATIONS_DATA}
-              selectedStation={selectedStation}
-              onSelectStation={(station) => setSelectedStation(station)}
-              filters={filters}
-              onUpdateFilters={handleUpdateFilters}
-              isCollapsed={isSidebarCollapsed}
-              onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-            />
+            {/* Left Sidebar (Only visible when navigation mode is disabled) */}
+            {!navigationMode && (
+              <StationSidebar
+                stations={filteredStations}
+                allStations={FUEL_STATIONS_DATA}
+                selectedStation={selectedStation}
+                onSelectStation={(station) => setSelectedStation(station)}
+                filters={filters}
+                onUpdateFilters={handleUpdateFilters}
+                isCollapsed={isSidebarCollapsed}
+                onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+              />
+            )}
 
             <div className="flex-1 relative h-full">
+              {/* Map Canvas */}
               <StationMap
                 stations={filteredStations}
                 allStations={FUEL_STATIONS_DATA}
@@ -167,7 +259,69 @@ export default function App() {
                 onToggleTier={handleToggleTier}
                 tankGallons={filters.tankGallons}
                 activeTrip={activeTrip}
+                activeRoute={activeRoute}
+                isMapPickingPU={isMapPickingPU}
+                isMapPickingDEL={isMapPickingDEL}
+                onMapClickPoint={handleMapClickPoint}
+                onCancelMapPick={handleCancelMapPick}
               />
+
+              {/* Mode Switcher Pill (Top Center Left): Switch between PU/DEL Road Navigation and Station Directory */}
+              <div className="absolute top-5 left-5 z-20 flex items-center bg-slate-900/95 border border-slate-700/80 rounded-xl p-1 shadow-2xl backdrop-blur-md text-xs">
+                <button
+                  type="button"
+                  onClick={() => setNavigationMode(true)}
+                  className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                    navigationMode
+                      ? 'bg-blue-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <span>🛣️</span>
+                  <span>PU & DEL Navigation</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNavigationMode(false)}
+                  className={`px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                    !navigationMode
+                      ? 'bg-red-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  <span>📍</span>
+                  <span>Browse All Stations</span>
+                </button>
+              </div>
+
+              {/* PU & DEL Highway Route Navigation Panel */}
+              {navigationMode && (
+                <div className="mt-14">
+                  <RouteNavigationPanel
+                    allStations={FUEL_STATIONS_DATA}
+                    activeRoute={activeRoute}
+                    isLoadingRoute={isLoadingRoute}
+                    onCalculateRoute={handleCalculateRoute}
+                    onClearRoute={handleClearRoute}
+                    onSelectStation={(station) => setSelectedStation(station)}
+                    isMapPickingPU={isMapPickingPU}
+                    isMapPickingDEL={isMapPickingDEL}
+                    onStartMapPickPU={() => {
+                      setIsMapPickingDEL(false);
+                      setIsMapPickingPU(true);
+                    }}
+                    onStartMapPickDEL={() => {
+                      setIsMapPickingPU(false);
+                      setIsMapPickingDEL(true);
+                    }}
+                    tankGallons={filters.tankGallons}
+                    corridorBuffer={corridorBuffer}
+                    onChangeCorridorBuffer={setCorridorBuffer}
+                    isCollapsed={isNavPanelCollapsed}
+                    onToggleCollapse={() => setIsNavPanelCollapsed(!isNavPanelCollapsed)}
+                  />
+                </div>
+              )}
             </div>
           </>
         )}

@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import { FuelStation, TIER_CONFIG } from '../data/fuelStations';
 import { ColorMetric, MapTileStyle, TripPlanResult } from '../types';
+import { NavigationRoute } from '../utils/routing';
 
 interface StationMapProps {
   stations: FuelStation[];
@@ -14,6 +15,11 @@ interface StationMapProps {
   onToggleTier: (tierId: string) => void;
   tankGallons: number;
   activeTrip: TripPlanResult | null;
+  activeRoute?: NavigationRoute | null;
+  isMapPickingPU?: boolean;
+  isMapPickingDEL?: boolean;
+  onMapClickPoint?: (lat: number, lng: number) => void;
+  onCancelMapPick?: () => void;
 }
 
 const TILE_PROVIDERS: Record<MapTileStyle, { url: string; attribution: string; maxZoom: number }> = {
@@ -49,7 +55,12 @@ export const StationMap: React.FC<StationMapProps> = ({
   activeTiers,
   onToggleTier,
   tankGallons,
-  activeTrip
+  activeTrip,
+  activeRoute,
+  isMapPickingPU = false,
+  isMapPickingDEL = false,
+  onMapClickPoint,
+  onCancelMapPick
 }) => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
@@ -57,6 +68,11 @@ export const StationMap: React.FC<StationMapProps> = ({
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
   const routeLayerRef = useRef<L.LayerGroup | null>(null);
   const userMarkerRef = useRef<L.Marker | null>(null);
+
+  const mapPickingRef = useRef({ isMapPickingPU, isMapPickingDEL, onMapClickPoint });
+  useEffect(() => {
+    mapPickingRef.current = { isMapPickingPU, isMapPickingDEL, onMapClickPoint };
+  }, [isMapPickingPU, isMapPickingDEL, onMapClickPoint]);
 
   const [tileStyle, setTileStyle] = useState<MapTileStyle>('dark');
   const [showStyleMenu, setShowStyleMenu] = useState(false);
@@ -79,6 +95,13 @@ export const StationMap: React.FC<StationMapProps> = ({
 
     map.on('zoomend', () => {
       setCurrentZoom(map.getZoom());
+    });
+
+    map.on('click', (e: L.LeafletMouseEvent) => {
+      const { isMapPickingPU, isMapPickingDEL, onMapClickPoint } = mapPickingRef.current;
+      if ((isMapPickingPU || isMapPickingDEL) && onMapClickPoint) {
+        onMapClickPoint(e.latlng.lat, e.latlng.lng);
+      }
     });
 
     const initialTile = TILE_PROVIDERS[tileStyle];
@@ -223,7 +246,7 @@ export const StationMap: React.FC<StationMapProps> = ({
     });
   }, [selectedStation]);
 
-  // Render Trip Route Polyline when Active
+  // Render Driving Navigation Highway Route (activeRoute) OR Corridor Trip (activeTrip)
   useEffect(() => {
     const map = mapInstanceRef.current;
     const routeGroup = routeLayerRef.current;
@@ -231,48 +254,134 @@ export const StationMap: React.FC<StationMapProps> = ({
 
     routeGroup.clearLayers();
 
-    if (!activeTrip) return;
+    // Priority 1: High-precision Driving Route (PU & DEL navigation)
+    if (activeRoute && activeRoute.geometry.length > 0) {
+      // Background highway glow line
+      const glowPolyline = L.polyline(activeRoute.geometry, {
+        color: '#1d4ed8',
+        weight: 8,
+        opacity: 0.55,
+        lineCap: 'round',
+        lineJoin: 'round'
+      });
 
-    const latlngs: [number, number][] = [
-      [activeTrip.origin.lat, activeTrip.origin.lng],
-      [activeTrip.destination.lat, activeTrip.destination.lng]
-    ];
+      // Foreground crisp highway line
+      const corePolyline = L.polyline(activeRoute.geometry, {
+        color: '#60a5fa',
+        weight: 3.5,
+        opacity: 0.95,
+        lineCap: 'round',
+        lineJoin: 'round'
+      });
 
-    // Origin marker
-    const originMarker = L.circleMarker([activeTrip.origin.lat, activeTrip.origin.lng], {
-      radius: 9,
-      fillColor: '#3b82f6',
-      color: '#ffffff',
-      weight: 2,
-      opacity: 1,
-      fillOpacity: 1
-    }).bindTooltip(`Start: ${activeTrip.origin.label}`, { permanent: true, direction: 'top' });
+      routeGroup.addLayer(glowPolyline);
+      routeGroup.addLayer(corePolyline);
 
-    // Destination marker
-    const destMarker = L.circleMarker([activeTrip.destination.lat, activeTrip.destination.lng], {
-      radius: 9,
-      fillColor: '#ef4444',
-      color: '#ffffff',
-      weight: 2,
-      opacity: 1,
-      fillOpacity: 1
-    }).bindTooltip(`End: ${activeTrip.destination.label}`, { permanent: true, direction: 'top' });
+      // Custom PU Pin Marker
+      const puIcon = L.divIcon({
+        className: 'pu-marker',
+        html: `<div style="display:flex;align-items:center;gap:4px;background:#059669;color:#ffffff;font-size:11px;font-weight:700;padding:4px 8px;border-radius:12px;border:2px solid #ffffff;box-shadow:0 4px 12px rgba(5,150,105,0.6);white-space:nowrap;font-family:sans-serif;">
+          <span>🟢 PU</span>
+        </div>`,
+        iconSize: [56, 26],
+        iconAnchor: [28, 13]
+      });
 
-    // Route corridor line
-    const polyline = L.polyline(latlngs, {
-      color: '#38bdf8',
-      weight: 4,
-      dashArray: '8, 8',
-      opacity: 0.85
-    });
+      const puMarker = L.marker([activeRoute.puLocation.lat, activeRoute.puLocation.lng], {
+        icon: puIcon,
+        zIndexOffset: 1000
+      }).bindPopup(
+        `<div style="font-family:sans-serif;font-size:12px;"><b>Pick-Up (Origin):</b><br/>${activeRoute.puLocation.label}</div>`
+      );
 
-    routeGroup.addLayer(originMarker);
-    routeGroup.addLayer(destMarker);
-    routeGroup.addLayer(polyline);
+      // Custom DEL Pin Marker
+      const delIcon = L.divIcon({
+        className: 'del-marker',
+        html: `<div style="display:flex;align-items:center;gap:4px;background:#dc2626;color:#ffffff;font-size:11px;font-weight:700;padding:4px 8px;border-radius:12px;border:2px solid #ffffff;box-shadow:0 4px 12px rgba(220,38,38,0.6);white-space:nowrap;font-family:sans-serif;">
+          <span>🔴 DEL</span>
+        </div>`,
+        iconSize: [62, 26],
+        iconAnchor: [31, 13]
+      });
 
-    // Fit map bounds to route
-    map.fitBounds(L.latLngBounds(latlngs), { padding: [60, 60] });
-  }, [activeTrip]);
+      const delMarker = L.marker([activeRoute.delLocation.lat, activeRoute.delLocation.lng], {
+        icon: delIcon,
+        zIndexOffset: 1000
+      }).bindPopup(
+        `<div style="font-family:sans-serif;font-size:12px;"><b>Delivery (Destination):</b><br/>${activeRoute.delLocation.label}</div>`
+      );
+
+      routeGroup.addLayer(puMarker);
+      routeGroup.addLayer(delMarker);
+
+      // Highlight the Cheapest Fuel Stop on Route with special badge
+      if (activeRoute.cheapestStop) {
+        const bestStop = activeRoute.cheapestStop;
+        const starIcon = L.divIcon({
+          className: 'best-fuel-marker',
+          html: `<div style="display:flex;align-items:center;gap:4px;background:#0f172a;color:#facc15;font-size:11px;font-weight:800;padding:3px 7px;border-radius:10px;border:2px solid #10b981;box-shadow:0 0 16px rgba(16,185,129,0.8);white-space:nowrap;font-family:monospace;">
+            <span>⭐ $${bestStop.station.best_disc.toFixed(3)}</span>
+          </div>`,
+          iconSize: [78, 24],
+          iconAnchor: [39, 32]
+        });
+
+        const starMarker = L.marker([bestStop.station.lat, bestStop.station.lng], {
+          icon: starIcon,
+          zIndexOffset: 990
+        });
+
+        starMarker.on('click', () => {
+          onSelectStation(bestStop.station);
+        });
+
+        routeGroup.addLayer(starMarker);
+      }
+
+      // Fit bounds to the route
+      map.fitBounds(L.latLngBounds(activeRoute.geometry), { padding: [70, 70] });
+      return;
+    }
+
+    // Priority 2: Simple Corridor Trip
+    if (activeTrip) {
+      const latlngs: [number, number][] = [
+        [activeTrip.origin.lat, activeTrip.origin.lng],
+        [activeTrip.destination.lat, activeTrip.destination.lng]
+      ];
+
+      const originMarker = L.circleMarker([activeTrip.origin.lat, activeTrip.origin.lng], {
+        radius: 9,
+        fillColor: '#3b82f6',
+        color: '#ffffff',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 1
+      }).bindTooltip(`Start: ${activeTrip.origin.label}`, { permanent: true, direction: 'top' });
+
+      const destMarker = L.circleMarker([activeTrip.destination.lat, activeTrip.destination.lng], {
+        radius: 9,
+        fillColor: '#ef4444',
+        color: '#ffffff',
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 1
+      }).bindTooltip(`End: ${activeTrip.destination.label}`, { permanent: true, direction: 'top' });
+
+      const polyline = L.polyline(latlngs, {
+        color: '#38bdf8',
+        weight: 4,
+        dashArray: '8, 8',
+        opacity: 0.85
+      });
+
+      routeGroup.addLayer(originMarker);
+      routeGroup.addLayer(destMarker);
+      routeGroup.addLayer(polyline);
+
+      map.fitBounds(L.latLngBounds(latlngs), { padding: [60, 60] });
+    }
+  }, [activeRoute, activeTrip]);
 
   // Map Controls Handlers
   const handleZoomIn = () => {
@@ -335,7 +444,33 @@ export const StationMap: React.FC<StationMapProps> = ({
   return (
     <div className="relative w-full h-full overflow-hidden bg-slate-950">
       {/* Map DOM Element */}
-      <div ref={mapContainerRef} className="w-full h-full z-0" />
+      <div
+        ref={mapContainerRef}
+        className={`w-full h-full z-0 ${
+          isMapPickingPU || isMapPickingDEL ? 'cursor-crosshair' : ''
+        }`}
+      />
+
+      {/* Interactive Map Picking Target Banner */}
+      {(isMapPickingPU || isMapPickingDEL) && (
+        <div className="absolute top-5 left-1/2 -translate-x-1/2 z-30 px-5 py-2.5 rounded-xl bg-slate-900/95 text-white text-xs border border-blue-500 shadow-2xl backdrop-blur-md flex items-center gap-3">
+          <span className="w-2.5 h-2.5 rounded-full animate-ping bg-blue-400" />
+          <span className="font-semibold text-sky-300">
+            {isMapPickingPU
+              ? 'Click anywhere on the map to set Pick-Up (PU) location'
+              : 'Click anywhere on the map to set Delivery (DEL) location'}
+          </span>
+          {onCancelMapPick && (
+            <button
+              type="button"
+              onClick={onCancelMapPick}
+              className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-[11px] font-semibold cursor-pointer border border-slate-700 transition-colors"
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Custom Dark Theme Navigation & Zoom Controls Dock (Positioned at Far Right, safely away from left sidebar) */}
       <div className="absolute top-5 right-5 z-20 flex flex-col items-center gap-2.5">
@@ -462,9 +597,9 @@ export const StationMap: React.FC<StationMapProps> = ({
         </div>
       )}
 
-      {/* Color Metric Selector (Top Left with comfortable margin from sidebar) */}
-      <div className="absolute top-5 left-5 z-10 flex items-center bg-slate-900/95 border border-slate-700/80 rounded-xl p-1 backdrop-blur-md shadow-xl text-xs">
-        <span className="text-slate-400 font-medium px-2.5 hidden sm:inline">Color By:</span>
+      {/* Color Metric Selector (Positioned to the left of the right-side controls dock) */}
+      <div className="absolute top-5 right-20 z-10 hidden sm:flex items-center bg-slate-900/95 border border-slate-700/80 rounded-xl p-1 backdrop-blur-md shadow-xl text-xs">
+        <span className="text-slate-400 font-medium px-2.5 hidden lg:inline">Color By:</span>
         <button
           type="button"
           onClick={() => onChangeColorMetric('best_disc')}
