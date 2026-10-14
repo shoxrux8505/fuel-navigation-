@@ -1,0 +1,6 @@
+{
+  "name": "Love's Fuel Navigator & Station Finder",
+  "description": "Interactive fuel price map and station finder with route planning, discount price tiers, savings analysis, and station details.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
